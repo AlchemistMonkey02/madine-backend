@@ -1,7 +1,13 @@
-require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+if (fs.existsSync(path.join(__dirname, '.env'))) {
+  require('dotenv').config({ path: path.join(__dirname, '.env') });
+} else if (fs.existsSync(path.join(__dirname, '..', '.env'))) {
+  require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+} else {
+  require('dotenv').config();
+}
 const express = require('express');
 const cors = require('cors');
 const compression = require('compression');
@@ -29,7 +35,9 @@ const isProd = NODE_ENV === 'production';
 
 // Only this folder is ever exposed to browsers — backend code, research data
 // and .env live outside it and can't be fetched.
-const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const PUBLIC_DIR = fs.existsSync(path.join(__dirname, 'public'))
+  ? path.join(__dirname, 'public')
+  : path.join(__dirname, '..', 'public');
 const CAFE_IMAGES_DIR = path.join(PUBLIC_DIR, 'cafe-images');
 const MENU_IMAGES_DIR = path.join(CAFE_IMAGES_DIR, 'menus');
 const IMAGE_EXT = /\.(jpe?g|png|webp)$/i;
