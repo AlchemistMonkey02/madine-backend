@@ -220,10 +220,27 @@ async function main() {
     console.warn('No café images found — run `npm run prepare-images` before deploying.');
   }
 
-  // --- Frontend (Optional / Fallback) ---
+  // --- Frontend / API Root ---
   if (fs.existsSync(PUBLIC_DIR)) {
     app.use(express.static(PUBLIC_DIR, { maxAge: isProd ? '1h' : 0 }));
   }
+
+  app.get('/', (req, res) => {
+    res.json({
+      status: 'online',
+      service: 'MADINE Backend API',
+      version: '1.0.0',
+      endpoints: {
+        cafes: '/api/cafes',
+        health: '/api/health'
+      }
+    });
+  });
+
+  app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date() });
+  });
+
   app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
   // eslint-disable-next-line no-unused-vars
   app.use('/api', (err, req, res, next) => {
@@ -232,8 +249,12 @@ async function main() {
     console.error(`${req.method} ${req.originalUrl} failed:`, err);
     res.status(500).json({ error: 'Something went wrong — try again' });
   });
-  if (fs.existsSync(PUBLIC_DIR)) {
-    app.use((req, res) => res.status(404).sendFile(path.join(PUBLIC_DIR, 'index.html')));
+
+  const indexPath = path.join(PUBLIC_DIR, 'index.html');
+  if (fs.existsSync(indexPath)) {
+    app.use((req, res) => res.status(404).sendFile(indexPath));
+  } else {
+    app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
   }
 
   server.listen(PORT, () => {
