@@ -1,15 +1,9 @@
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
-if (fs.existsSync(path.join(__dirname, '.env'))) {
-  require('dotenv').config({ path: path.join(__dirname, '.env') });
-} else if (fs.existsSync(path.join(__dirname, '..', '.env'))) {
-  require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
-} else {
-  require('dotenv').config();
-}
+const crypto = require('crypto');
 const express = require('express');
-const cors = require('cors');
 const compression = require('compression');
 const { MongoClient } = require('mongodb');
 const { transformCafeDoc, encodeUrlPath } = require('./lib/transformCafe');
@@ -17,6 +11,8 @@ const { setupAuth } = require('./lib/auth');
 const { setupSocial } = require('./lib/social');
 const { createRealtime, setupChat } = require('./lib/chat');
 const { setupCommunity } = require('./lib/community');
+const { setupPlatform, approvedCafeView } = require('./lib/platform');
+const { createCatalogResponseCache } = require('./lib/catalogResponse');
 const mailer = require('./lib/mailer');
 
 const {
@@ -24,20 +20,56 @@ const {
   MONGODB_DB = 'madine',
   MONGODB_COLLECTION = 'madine_core',
   DATASET_ROOT,
-  PORT = 4000,
+  PORT = process.env.NODE_ENV === 'production' ? 3000 : 4000,
   NODE_ENV = 'development',
-  FRONTEND_URL,
-  CLIENT_URL,
-  CORS_ORIGIN,
 } = process.env;
 
 const isProd = NODE_ENV === 'production';
+const listenPort = Number(PORT);
+
+function validateProductionConfig() {
+  const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number);
+  if (nodeMajor < 22 || (nodeMajor === 22 && nodeMinor < 11) || nodeMajor >= 25) {
+    throw new Error('MADINE requires Node.js 22.11 or newer in the 22.x or 24.x LTS line');
+  }
+  if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
+    throw new Error('PORT must be an integer between 1 and 65535');
+  }
+  if (!isProd) return;
+  let publicUrl;
+  try { publicUrl = new URL(process.env.APP_URL || ''); } catch {}
+  if (!publicUrl || publicUrl.protocol !== 'https:' || publicUrl.username || publicUrl.password ||
+      publicUrl.pathname !== '/' || publicUrl.search || publicUrl.hash) {
+    throw new Error('Production requires APP_URL to be a valid HTTPS origin');
+  }
+  const smtpPort = Number(process.env.SMTP_PORT || 587);
+  if (!process.env.SMTP_HOST || !Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535 ||
+      !process.env.SMTP_USER || !process.env.SMTP_PASS || !process.env.MAIL_FROM) {
+    throw new Error('Production requires SMTP_HOST, a valid SMTP_PORT, SMTP_USER, SMTP_PASS and MAIL_FROM');
+  }
+}
 
 // Only this folder is ever exposed to browsers — backend code, research data
 // and .env live outside it and can't be fetched.
-const PUBLIC_DIR = fs.existsSync(path.join(__dirname, 'public'))
-  ? path.join(__dirname, 'public')
-  : path.join(__dirname, '..', 'public');
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const INDEX_HTML = path.join(PUBLIC_DIR, 'index.html');
+// The static preload helper is the only inline script. Hash it so CSP can
+// allow that exact code without enabling arbitrary inline scripts/handlers.
+const inlineScriptHashes = [...fs.readFileSync(INDEX_HTML, 'utf8').matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)]
+  .filter((match) => !/\bsrc\s*=/.test(match[0].slice(0, match[0].indexOf('>') + 1)))
+  .map((match) => `'sha256-${crypto.createHash('sha256').update(match[1].replace(/\r\n?/g, '\n')).digest('base64')}'`);
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  `script-src 'self' ${inlineScriptHashes.join(' ')}`,
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data:",
+  "connect-src 'self' ws: wss:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'self'",
+].join('; ');
 const CAFE_IMAGES_DIR = path.join(PUBLIC_DIR, 'cafe-images');
 const MENU_IMAGES_DIR = path.join(CAFE_IMAGES_DIR, 'menus');
 const IMAGE_EXT = /\.(jpe?g|png|webp)$/i;
@@ -81,42 +113,42 @@ function menuImagesFor(doc) {
 }
 
 async function main() {
-  let client = null;
-  let db = null;
+  validateProductionConfig();
+  if (!MONGODB_URI) throw new Error('MONGODB_URI is not set (see .env.example)');
 
-  if (MONGODB_URI) {
-    client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    console.log('Connected to MongoDB:', MONGODB_DB + '.' + MONGODB_COLLECTION);
-    db = client.db(MONGODB_DB);
-  } else {
-    console.log('No MONGODB_URI provided — running in standalone local memory mode.');
-    const { createMemoryDb } = require('./lib/memoryDb');
-    db = createMemoryDb();
-    try {
-      const { build250Cafes } = require('../tools/seed_cafes');
-      const cafes = build250Cafes();
-      const col = db.collection(MONGODB_COLLECTION);
-      for (const cafe of cafes) {
-        await col.insertOne(cafe);
-      }
-      console.log(`Loaded ${cafes.length} cafes into in-memory store.`);
-    } catch (e) {
-      console.warn('Could not auto-seed in-memory cafes:', e.message);
+  const client = new MongoClient(MONGODB_URI);
+  await client.connect();
+  if (isProd) {
+    const topology = await client.db('admin').command({ hello: 1 });
+    if (!(topology.setName || topology.msg === 'isdbgrid') || topology.logicalSessionTimeoutMinutes == null) {
+      await client.close();
+      throw new Error('Production MongoDB must be a replica set or sharded cluster with transaction support');
     }
   }
-
+  console.log('Connected to MongoDB:', MONGODB_DB + '.' + MONGODB_COLLECTION);
+  const db = client.db(MONGODB_DB);
   const collection = db.collection(MONGODB_COLLECTION);
 
   let cafeCache = null;
   let cafeCacheAt = 0;
+  let cafeCacheLoading = null;
   async function getCafes() {
-    if (!cafeCache || Date.now() - cafeCacheAt > CAFE_CACHE_MS) {
-      const docs = await collection.find({}).toArray();
-      cafeCache = docs.map((doc) => transformCafeDoc(doc, { menuImages: menuImagesFor(doc) }));
+    if (cafeCache && Date.now() - cafeCacheAt <= CAFE_CACHE_MS) return cafeCache;
+    if (!cafeCacheLoading) cafeCacheLoading = (async () => {
+      const [docs, managed] = await Promise.all([
+        collection.find({}).toArray(),
+        db.collection('cafe_submissions').find({ publishedDetails: { $exists: true } }).toArray(),
+      ]);
+      const catalog = new Map(docs.map((doc) => [doc.id, transformCafeDoc(doc, { menuImages: menuImagesFor(doc) })]));
+      for (const doc of managed) {
+        const cafe = approvedCafeView(doc, catalog.get(doc.existingCafeId));
+        catalog.set(cafe.id, cafe);
+      }
+      cafeCache = [...catalog.values()];
       cafeCacheAt = Date.now();
-    }
-    return cafeCache;
+      return cafeCache;
+    })().finally(() => { cafeCacheLoading = null; });
+    return cafeCacheLoading;
   }
   let cafeIdSet = null;
   let cafeIdSetFor = null;
@@ -126,63 +158,53 @@ async function main() {
     return cafeIdSet;
   }
 
-  const configuredOrigins = [
-    FRONTEND_URL,
-    CLIENT_URL,
-    ...(CORS_ORIGIN ? CORS_ORIGIN.split(',').map((s) => s.trim()) : []),
-  ].filter(Boolean);
-
-  const corsOrigins = configuredOrigins.length ? configuredOrigins : ['*'];
-
   const app = express();
   const server = http.createServer(app);
-  const { io, notify } = createRealtime(server, { corsOrigins });
-
+  const { io, notify } = createRealtime(server);
   app.disable('x-powered-by');
-  app.set('trust proxy', 1); // behind the host's HTTPS proxy (Render, Nginx, etc.)
+  app.set('trust proxy', isProd ? 1 : false); // production hosts must use one trusted HTTPS reverse proxy
   app.use(compression());
-
-  // CORS middleware for separated frontend and API access
-  app.use(
-    cors({
-      origin: (origin, callback) => {
-        if (!origin) return callback(null, true);
-        if (corsOrigins.includes('*') || corsOrigins.includes(origin)) return callback(null, true);
-        // Allow all local development origins (localhost / 127.0.0.1 on any port)
-        if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
-          return callback(null, true);
-        }
-        if (configuredOrigins.some((allowed) => allowed === origin || (allowed.endsWith('*') && origin.startsWith(allowed.slice(0, -1))))) {
-          return callback(null, true);
-        }
-        if (!isProd) return callback(null, true);
-        callback(null, true);
-      },
-      credentials: true,
-      methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'X-Requested-With'],
-      exposedHeaders: ['Set-Cookie'],
-    })
-  );
-
   app.use((req, res, next) => {
+    res.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY);
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    if (isProd && req.secure) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
     next();
   });
 
   // --- API routes ---
-  const { requireUser, resolveToken, cookieName } = await setupAuth(app, db, { isProd });
+  const { requireUser, resolveToken, cookieName } = await setupAuth(app, db, {
+    isProd,
+    onSessionRevoked: (id) => {
+      io.to(`session:${id}`).emit('session:invalid');
+      io.in(`session:${id}`).disconnectSockets(true);
+    },
+  });
   if (!mailer.isConfigured()) console.warn('SMTP not configured — emails will be printed here instead of sent.');
-  const { requireProfile, connectedIds, pairKey, toId } = await setupSocial(app, db, { requireUser, getCafeIds, notify });
+  let platformNotify = async () => {};
+  const pushNotification = (...args) => platformNotify(...args);
+  const { requireProfile, connectedIds, pairKey, toId } = await setupSocial(app, db, { requireUser, getCafeIds, notify, pushNotification });
+  const platform = await setupPlatform(app, db, { requireUser, requireProfile, getCafes, toId, notify, invalidateCafeCache: () => { cafeCache = null; cafeCacheAt = 0; } });
+  platformNotify = platform.pushNotification;
   await setupChat(app, db, { io, notify, resolveToken, cookieName, requireUser, connectedIds, pairKey, toId });
-  await setupCommunity(app, db, { requireUser, requireProfile, getCafes, toId });
+  await setupCommunity(app, db, { client, requireUser, requireProfile, getCafes, toId, pushNotification });
 
+  const catalogResponseFor = createCatalogResponseCache();
   app.get('/api/cafes', async (req, res) => {
     try {
       const cafes = await getCafes();
+      const payload = await catalogResponseFor(cafes);
       res.set('Cache-Control', 'public, max-age=300');
-      res.json({ count: cafes.length, cafes });
+      res.set('ETag', payload.etag);
+      res.vary('Accept-Encoding');
+      if (req.fresh) return res.status(304).end();
+      res.type('application/json');
+      if (req.acceptsEncodings('gzip', 'identity') === 'gzip') {
+        res.set('Content-Encoding', 'gzip');
+        return res.send(payload.gzip);
+      }
+      res.send(payload.json);
     } catch (err) {
       console.error('GET /api/cafes failed:', err);
       res.status(500).json({ error: 'Failed to load cafes' });
@@ -200,47 +222,31 @@ async function main() {
     }
   });
 
-  app.get('/api/health', (req, res) => res.json({ ok: true, email: mailer.isConfigured() ? 'smtp' : 'console-only' }));
+  app.get('/api/health', async (req, res) => {
+    try {
+      await client.db(MONGODB_DB).command({ ping: 1 });
+      res.json({ ok: true, email: mailer.isConfigured() ? 'smtp' : 'console-only' });
+    } catch {
+      res.status(503).json({ ok: false });
+    }
+  });
 
   // --- Café photos + menu cards ---
-  // Static route with cross-origin headers so standalone frontends can render them
+  // Production: web-sized copies in public/cafe-images (npm run prepare-images).
+  // Local dev: anything not prepared yet falls through to the raw dataset folder.
   const imageDirs = [CAFE_IMAGES_DIR, DATASET_ROOT].filter((d) => d && fs.existsSync(d));
-  imageDirs.forEach((dir) =>
-    app.use(
-      '/cafe-images',
-      (req, res, next) => {
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-        next();
-      },
-      express.static(dir, { maxAge: '30d', immutable: true })
-    )
-  );
+  imageDirs.forEach((dir) => app.use('/cafe-images', express.static(dir, { maxAge: '30d', immutable: true })));
   if (!imageDirs.length) {
     console.warn('No café images found — run `npm run prepare-images` before deploying.');
   }
 
-  // --- Frontend / API Root ---
-  if (fs.existsSync(PUBLIC_DIR)) {
-    app.use(express.static(PUBLIC_DIR, { maxAge: isProd ? '1h' : 0 }));
-  }
-
-  app.get('/', (req, res) => {
-    res.json({
-      status: 'online',
-      service: 'MADINE Backend API',
-      version: '1.0.0',
-      endpoints: {
-        cafes: '/api/cafes',
-        health: '/api/health'
-      }
-    });
-  });
-
-  app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date() });
-  });
-
+  // --- Frontend ---
+  app.use(express.static(PUBLIC_DIR, {
+    maxAge: isProd ? '1h' : 0,
+    setHeaders(res, filePath) {
+      if (path.extname(filePath) === '.html') res.setHeader('Cache-Control', 'no-cache');
+    },
+  }));
   app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
   // eslint-disable-next-line no-unused-vars
   app.use('/api', (err, req, res, next) => {
@@ -249,17 +255,11 @@ async function main() {
     console.error(`${req.method} ${req.originalUrl} failed:`, err);
     res.status(500).json({ error: 'Something went wrong — try again' });
   });
+  app.use((req, res) => res.status(404).sendFile(path.join(PUBLIC_DIR, 'index.html')));
 
-  const indexPath = path.join(PUBLIC_DIR, 'index.html');
-  if (fs.existsSync(indexPath)) {
-    app.use((req, res) => res.status(404).sendFile(indexPath));
-  } else {
-    app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
-  }
-
-  server.listen(PORT, () => {
-    console.log(`\nVYBE Platform running at http://localhost:${PORT} (${NODE_ENV})`);
-    console.log(`API:  http://localhost:${PORT}/api/cafes`);
+  server.listen(listenPort, '0.0.0.0', () => {
+    console.log(`\nMADINE listening on port ${listenPort} (${NODE_ENV})`);
+    console.log('API: /api/cafes');
   });
 
   // Hosts send SIGTERM on every redeploy — finish in-flight requests first.
@@ -268,13 +268,8 @@ async function main() {
     // and never wait more than a few seconds (dev restarts, redeploys).
     setTimeout(() => process.exit(0), 3000).unref();
     io.close();
-    server.close(() => {
-      if (client) {
-        client.close().finally(() => process.exit(0));
-      } else {
-        process.exit(0);
-      }
-    });
+    server.closeAllConnections();
+    server.close(() => client.close().finally(() => process.exit(0)));
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
